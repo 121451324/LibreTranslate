@@ -24,6 +24,7 @@ from werkzeug.utils import secure_filename
 
 from libretranslate import flood, remove_translated_files, scheduler, secret, security, storage, cache
 from libretranslate.language import model2iso, iso2model, detect_languages, improve_translation_formatting, get_language_with_fallback
+from libretranslate.terminology import Terminology
 from libretranslate.locales import (
     _,
     _lazy,
@@ -37,6 +38,25 @@ from libretranslate.locales import (
 
 from .api_keys import Database, RemoteDatabase
 from .suggestions import Database as SuggestionsDatabase
+
+# ---------------------------------------------------------------------------
+# 校园术语库
+#
+# 术语表放在仓库根目录的 terminology/campus_terms.csv，
+# 与代码分离 —— 教务老师或俄方教师可以直接用 Excel 编辑，不必碰代码。
+#
+# 这里做延迟加载：启动时先不读文件，第一次翻译请求到来时才读。
+# 好处是术语表即使写坏了，也不会拖垮整个翻译服务的启动。
+# ---------------------------------------------------------------------------
+_terminology = None
+
+
+def get_terminology():
+    global _terminology
+    if _terminology is None:
+        disabled = os.environ.get("LIBRETRANSLATE_DISABLE_TERMINOLOGY") in ("1", "true", "True")
+        _terminology = Terminology(enabled=not disabled)
+    return _terminology
 
 # Rough map of emoji characters
 emojis = {e: True for e in \
@@ -830,8 +850,23 @@ def create_app(args):
                           translated_text = unescape(str(translate_html(translator, text)))
                           alternatives = [] # Not supported for html yet
                       else:
-                          hypotheses = translator.hypotheses(text, num_alternatives + 1)
-                          translated_text = unescape(improve_translation_formatting(text, hypotheses[0].value))
+                          # —— 术语库：翻译前把命中的校园术语换成占位符 ——
+                          terminology = get_terminology()
+                          masked_text, term_map = terminology.mask(text, src_lang.code, scheme=0)
+                          hypotheses = translator.hypotheses(masked_text, num_alternatives + 1)
+                          translated_text = unescape(improve_translation_formatting(masked_text, hypotheses[0].value))
+                          # —— 术语库：翻译后把占位符还原成目标语言的术语 ——
+                          translated_text, term_stats = terminology.unmask(translated_text, term_map, tgt_lang.code)
+
+                          # 有术语没保住时换另一套占位符重试一次（理由同单条分支）
+                          if term_stats["missing"]:
+                              masked_alt, map_alt = terminology.mask(text, src_lang.code, scheme=1)
+                              alt_hypotheses = translator.hypotheses(masked_alt, 1)
+                              alt_text = unescape(improve_translation_formatting(masked_alt, alt_hypotheses[0].value))
+                              alt_text, alt_stats = terminology.unmask(alt_text, map_alt, tgt_lang.code)
+                              if len(alt_stats["missing"]) < len(term_stats["missing"]):
+                                  translated_text = alt_text
+
                           alternatives = filter_unique([unescape(improve_translation_formatting(text, hypotheses[i].value)) for i in range(1, len(hypotheses))], translated_text)
                     else:
                       translated_text = text # Cannot translate, send the original text back
@@ -856,8 +891,24 @@ def create_app(args):
                       translated_text = unescape(str(translate_html(translator, q)))
                       alternatives = [] # Not supported for html yet
                   else:
-                      hypotheses = translator.hypotheses(q, num_alternatives + 1)
-                      translated_text = unescape(improve_translation_formatting(q, hypotheses[0].value))
+                      # —— 术语库：翻译前把命中的校园术语换成占位符 ——
+                      terminology = get_terminology()
+                      masked_text, term_map = terminology.mask(q, src_lang.code, scheme=0)
+                      hypotheses = translator.hypotheses(masked_text, num_alternatives + 1)
+                      translated_text = unescape(improve_translation_formatting(masked_text, hypotheses[0].value))
+                      # —— 术语库：翻译后把占位符还原成目标语言的术语 ——
+                      translated_text, term_stats = terminology.unmask(translated_text, term_map, tgt_lang.code)
+
+                      # 有术语没保住（模型把占位符吞掉了）：换另一套占位符重试一次。
+                      # 实测「丢词」跟占位符方案有关，两套方案互为兜底能再救回一部分。
+                      if term_stats["missing"]:
+                          masked_alt, map_alt = terminology.mask(q, src_lang.code, scheme=1)
+                          alt_hypotheses = translator.hypotheses(masked_alt, 1)
+                          alt_text = unescape(improve_translation_formatting(masked_alt, alt_hypotheses[0].value))
+                          alt_text, alt_stats = terminology.unmask(alt_text, map_alt, tgt_lang.code)
+                          if len(alt_stats["missing"]) < len(term_stats["missing"]):
+                              translated_text = alt_text
+
                       alternatives = filter_unique([unescape(improve_translation_formatting(q, hypotheses[i].value)) for i in range(1, len(hypotheses))], translated_text)
                 else:
                   translated_text = q # Cannot translate, send the original text back
